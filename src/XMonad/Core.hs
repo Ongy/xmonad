@@ -1,5 +1,6 @@
 {-# LANGUAGE ExistentialQuantification, FlexibleInstances, GeneralizedNewtypeDeriving,
-             MultiParamTypeClasses, TypeSynonymInstances, DeriveDataTypeable #-}
+             MultiParamTypeClasses, TypeSynonymInstances, DeriveDataTypeable,
+             LambdaCase #-}
 
 -----------------------------------------------------------------------------
 -- |
@@ -49,7 +50,7 @@ import System.Posix.Process (executeFile, forkProcess, getAnyProcessStatus, crea
 import System.Posix.Signals
 import System.Posix.IO
 import System.Posix.Types (ProcessID)
-import System.Process
+import System.Process (waitForProcess, runProcess)
 import System.Directory
 import System.Exit
 import Graphics.X11.Xlib
@@ -448,6 +449,36 @@ runOnWorkspaces job = do
              $ current ws : visible ws
     modify $ \s -> s { windowset = ws { current = c, visible = v, hidden = h } }
 
+-- | Test whether we should prefer the XDG spec directories for xmonad
+-- directories, or the legacy unified directory.
+-- XDG is prefered, of the @$XDG_CONFIG_HOME/xmonad@ directory exists.
+preferXDGDirs :: MonadIO m => m Bool
+preferXDGDirs = io (doesDirectoryExist =<< getXDGDirectory XDGConfig "xmonad")
+
+createXMonadDir :: MonadIO m => String -> XDGDirectory -> m String
+createXMonadDir env xdg = io $ do
+    path <- lookupEnv ("XMONAD_" ++ env ++ "_DIR") >>= \case
+        -- Check if we got a directory provided over the env variable
+        Just path -> pure path
+        -- Otherwise check if we should prefer XDG dirs or the "legacy" xmonad
+        -- dir
+        Nothing -> do
+            pXdg <- preferXDGDirs
+            if pXdg then getXDGDirectory xdg "xmonad" else getAppUserDataDirectory "xmonad"
+    createDirectoryIfMissing True path
+    pure path
+
+getXMonadDir' :: MonadIO m => String -> XDGDirectory -> m String
+getXMonadDir' env xdg = do
+    found <- findFirstDirWithEnv ("XMONAD_" ++ env ++ "_DIR")
+      [ getAppUserDataDirectory "xmonad"
+      , getXDGDirectory XDGConfig "xmonad"
+      ]
+    case found of
+        Just path -> pure path
+        Nothing -> createXMonadDir env xdg
+
+
 -- | Return the path to the xmonad configuration directory.  This
 -- directory is where user configuration files are stored (e.g, the
 -- xmonad.hs file).  You may also create a @lib@ subdirectory in the
@@ -465,11 +496,7 @@ runOnWorkspaces job = do
 -- directories exist then (1) will be used if it is set, otherwise (2)
 -- will be used.  Either way, a directory will be created if necessary.
 getXMonadDir :: MonadIO m => m String
-getXMonadDir =
-    findFirstDirWithEnv "XMONAD_CONFIG_DIR"
-      [ getAppUserDataDirectory "xmonad"
-      , getXDGDirectory XDGConfig "xmonad"
-      ]
+getXMonadDir = getXMonadDir' "CONFIG" XDGConfig
 
 -- | Return the path to the xmonad cache directory.  This directory is
 -- used to store temporary files that can easily be recreated.  For
@@ -485,11 +512,25 @@ getXMonadDir =
 -- directories exist then (1) will be used if it is set, otherwise (2)
 -- will be used.  Either way, a directory will be created if necessary.
 getXMonadCacheDir :: MonadIO m => m String
-getXMonadCacheDir =
-    findFirstDirWithEnv "XMONAD_CACHE_DIR"
+getXMonadCacheDir = io $ do
+    found <- findFirstDirWithEnv "XMONAD_CACHE_DIR"
       [ getAppUserDataDirectory "xmonad"
       , getXDGDirectory XDGCache "xmonad"
       ]
+    case found of
+        Just path -> pure path
+        Nothing -> do
+            path <- lookupEnv "XMONAD_CACHE_DIR" >>= \case
+                Just path -> pure path
+                Nothing -> lookupEnv "XMONAD_DATA_DIR" >>= \case
+                    Just path -> pure path
+                    Nothing -> do
+                        xdg <- preferXDGDirs
+                        if xdg
+                            then getXDGDirectory XDGConfig "xmonad"
+                            else getAppUserDataDirectory "xmonad"
+            createDirectoryIfMissing True path
+            pure path
 
 -- | Return the path to the xmonad data directory.  This directory is
 -- used by XMonad to store data files such as the run-time state file
@@ -505,28 +546,12 @@ getXMonadCacheDir =
 -- directories exist then (1) will be used if it is set, otherwise (2)
 -- will be used.  Either way, a directory will be created if necessary.
 getXMonadDataDir :: MonadIO m => m String
-getXMonadDataDir =
-    findFirstDirWithEnv "XMONAD_DATA_DIR"
-      [ getAppUserDataDirectory "xmonad"
-      , getXDGDirectory XDGData "xmonad"
-      ]
+getXMonadDataDir = getXMonadDir' "DATA" XDGData
 
 -- | Helper function that will find the first existing directory and
--- return its path.  If none of the directories can be found, create
--- and return the first from the list.  If the list is empty this
--- function returns the historical @~\/.xmonad@ directory.
-findFirstDirOf :: MonadIO m => [IO FilePath] -> m FilePath
-findFirstDirOf []        = findFirstDirOf [getAppUserDataDirectory "xmonad"]
-findFirstDirOf possibles = do
-    found <- go possibles
-
-    case found of
-      Just path -> return path
-      Nothing   -> do
-        primary <- io (head possibles)
-        io (createDirectoryIfMissing True primary)
-        return primary
-
+-- return its path.
+findFirstDirOf :: MonadIO m => [IO FilePath] -> m (Maybe FilePath)
+findFirstDirOf possibles = go possibles
   where
     go []     = return Nothing
     go (x:xs) = do
@@ -536,7 +561,7 @@ findFirstDirOf possibles = do
 
 -- | Simple wrapper around @findFirstDirOf@ that allows the primary
 -- path to be specified by an environment variable.
-findFirstDirWithEnv :: MonadIO m => String -> [IO FilePath] -> m FilePath
+findFirstDirWithEnv :: MonadIO m => String -> [IO FilePath] -> m (Maybe FilePath)
 findFirstDirWithEnv envName paths = do
     envPath' <- io (getEnv envName)
 
@@ -593,6 +618,7 @@ recompile :: MonadIO m => Bool -> m Bool
 recompile force = io $ do
     cfgdir  <- getXMonadDir
     datadir <- getXMonadDataDir
+    cacheDir <- getXMonadCacheDir
     let binn = "xmonad-"++arch++"-"++os
         bin  = datadir </> binn
         err  = datadir </> "xmonad.errors"
@@ -615,7 +641,7 @@ recompile force = io $ do
         status <- bracket (openFile err WriteMode) hClose $ \errHandle ->
             waitForProcess =<< if useBuildscript
                                then compileScript bin cfgdir buildscript errHandle
-                               else compileGHC bin cfgdir errHandle
+                               else compileGHC bin cfgdir errHandle cacheDir
 
         -- re-enable SIGCHLD:
         installSignalHandlers
@@ -648,7 +674,7 @@ recompile force = io $ do
            '\8216' -> '`'  -- ‘
            '\8217' -> '`'  -- ’
            _ -> c
-       compileGHC bin dir errHandle =
+       compileGHC bin dir errHandle cacheDir =
          runProcess "ghc" ["--make"
                           , "xmonad.hs"
                           , "-i"
@@ -657,6 +683,8 @@ recompile force = io $ do
                           , "-main-is", "main"
                           , "-v0"
                           , "-o", bin
+                          , "-odir", cacheDir
+                          , "-hidir", cacheDir
                           ] (Just dir) Nothing Nothing Nothing (Just errHandle)
        compileScript bin dir script errHandle =
          runProcess script [bin] (Just dir) Nothing Nothing Nothing (Just errHandle)
